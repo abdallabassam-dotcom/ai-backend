@@ -16,27 +16,21 @@ const app = express();
 // IMPORTANT for cookies across Vercel <-> Railway
 app.set("trust proxy", 1);
 
-app.use(cors({
-  origin: true,
-  credentials: true,
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "x-device-fingerprint",
-    "x-admin-key"
-  ],
-  methods: ["GET", "POST", "OPTIONS"]
-}));
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization", "x-device-fingerprint", "x-admin-key"],
+    methods: ["GET", "POST", "OPTIONS"],
+  })
+);
 app.options("*", cors());
 
 app.use(express.json());
 app.use(cookieParser());
 
 // Supabase Admin client (server-only)
-const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const supabaseAdmin = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 // -------- helpers --------
 
@@ -47,7 +41,7 @@ async function getUserFromBearer(req) {
 
   const { data, error } = await supabaseAdmin.auth.getUser(token);
   if (error || !data?.user) return null;
-  return data.user; // { id, email, ... }
+  return data.user;
 }
 
 function requireAdmin(req, res, next) {
@@ -71,7 +65,7 @@ function ensureDeviceCookie(req, res) {
     res.cookie("device_id", deviceId, {
       httpOnly: true,
       sameSite: "none",
-      secure: true
+      secure: true,
     });
   }
   return deviceId;
@@ -92,11 +86,10 @@ app.post("/admin/generate-trial-code", requireAdmin, async (req, res) => {
     const code = "TRIAL-" + crypto.randomBytes(4).toString("hex").toUpperCase();
 
     await pool.query(
-  `insert into trial_codes (code, used, duration_days, expires_at)
-   values ($1, false, $2, now() + ($3 * interval '1 day'))`,
-  [code, days, expiresInDays]
-);
-
+      `insert into trial_codes (code, used, duration_days, expires_at)
+       values ($1, false, $2, now() + ($3 * interval '1 day'))`,
+      [code, days, expiresInDays]
+    );
 
     res.json({ code, days });
   } catch (e) {
@@ -129,7 +122,7 @@ app.post("/redeem-trial-code", async (req, res) => {
       return res.status(400).json({ error: "Invalid/used/expired code" });
     }
 
-    const durationDays = used.rows[0].duration_days ?? 7;
+    const durationDays = Number(used.rows[0].duration_days ?? 7);
 
     // upsert user
     await pool.query(
@@ -142,12 +135,12 @@ app.post("/redeem-trial-code", async (req, res) => {
     // activate trial (device_limit=1, ip_limit=1)
     await pool.query(
       `insert into subscriptions (user_id, plan, active, start_at, end_at, ip_limit, device_limit, is_trial)
-       values ($1, 'trial', true, now(), now() + ($2 || ' days')::interval, 1, 1, true)
+       values ($1, 'trial', true, now(), now() + ($2 * interval '1 day'), 1, 1, true)
        on conflict (user_id) do update
          set plan='trial',
              active=true,
              start_at=now(),
-             end_at=now() + ($2 || ' days')::interval,
+             end_at=now() + ($2 * interval '1 day'),
              ip_limit=1,
              device_limit=1,
              is_trial=true`,
@@ -163,79 +156,83 @@ app.post("/redeem-trial-code", async (req, res) => {
 
 // 3) Middleware: check subscription + device+ip limits
 async function requireActiveSubAndLimits(req, res, next) {
-  const user = await getUserFromBearer(req);
-  if (!user) return res.status(401).json({ error: "Not logged in" });
+  try {
+    const user = await getUserFromBearer(req);
+    if (!user) return res.status(401).json({ error: "Not logged in" });
 
-  const fingerprint = req.headers["x-device-fingerprint"]?.toString() || "";
-  if (!fingerprint) return res.status(400).json({ error: "Missing fingerprint" });
+    const fingerprint = req.headers["x-device-fingerprint"]?.toString() || "";
+    if (!fingerprint) return res.status(400).json({ error: "Missing fingerprint" });
 
-  const deviceId = ensureDeviceCookie(req, res);
-  const ip = getIp(req);
+    const deviceId = ensureDeviceCookie(req, res);
+    const ip = getIp(req);
 
-  const sub = await pool.query(
-    `select active, end_at, device_limit, ip_limit
-     from subscriptions
-     where user_id=$1`,
-    [user.id]
-  );
-
-  if (sub.rows.length === 0 || !sub.rows[0].active) {
-    return res.status(403).json({ error: "No active subscription" });
-  }
-
-  const endAt = sub.rows[0].end_at;
-  if (!endAt || new Date(endAt).getTime() < Date.now()) {
-    return res.status(403).json({ error: "Trial/plan expired" });
-  }
-
-  const deviceLimit = Number(sub.rows[0].device_limit ?? 0);
-  const ipLimit = Number(sub.rows[0].ip_limit ?? 0);
-
-  // device check
-  const existingDevice = await pool.query(
-    `select id from user_devices where user_id=$1 and device_id=$2`,
-    [user.id, deviceId]
-  );
-
-  if (existingDevice.rows.length === 0) {
-    const count = await pool.query(
-      `select count(*)::int as c from user_devices where user_id=$1`,
+    const sub = await pool.query(
+      `select active, end_at, device_limit, ip_limit
+       from subscriptions
+       where user_id=$1`,
       [user.id]
     );
-    if (count.rows[0].c >= deviceLimit) {
-      return res.status(403).json({ error: "Device limit reached" });
+
+    if (sub.rows.length === 0 || !sub.rows[0].active) {
+      return res.status(403).json({ error: "No active subscription" });
     }
 
-    await pool.query(
-      `insert into user_devices (user_id, device_id, fingerprint, ip, last_seen)
-       values ($1,$2,$3,$4,now())`,
-      [user.id, deviceId, fingerprint, ip]
-    );
-  } else {
-    await pool.query(
-      `update user_devices
-       set last_seen=now(), fingerprint=$3, ip=$4
-       where user_id=$1 and device_id=$2`,
-      [user.id, deviceId, fingerprint, ip]
-    );
-  }
-
-  // ip limit check (unique ips in last 24h)
-  if (ipLimit > 0) {
-    const ips = await pool.query(
-      `select count(distinct ip)::int as c
-       from user_devices
-       where user_id=$1
-         and last_seen > now() - interval '24 hours'`,
-      [user.id]
-    );
-    if (ips.rows[0].c > ipLimit) {
-      return res.status(403).json({ error: "IP limit reached" });
+    const endAt = sub.rows[0].end_at;
+    if (!endAt || new Date(endAt).getTime() < Date.now()) {
+      return res.status(403).json({ error: "Trial/plan expired" });
     }
-  }
 
-  req.user = user;
-  next();
+    const deviceLimit = Number(sub.rows[0].device_limit ?? 0);
+    const ipLimit = Number(sub.rows[0].ip_limit ?? 0);
+
+    // device check
+    const existingDevice = await pool.query(
+      `select id from user_devices where user_id=$1 and device_id=$2`,
+      [user.id, deviceId]
+    );
+
+    if (existingDevice.rows.length === 0) {
+      const count = await pool.query(`select count(*)::int as c from user_devices where user_id=$1`, [user.id]);
+
+      if (count.rows[0].c >= deviceLimit) {
+        return res.status(403).json({ error: "Device limit reached" });
+      }
+
+      await pool.query(
+        `insert into user_devices (user_id, device_id, fingerprint, ip, last_seen)
+         values ($1,$2,$3,$4,now())`,
+        [user.id, deviceId, fingerprint, ip]
+      );
+    } else {
+      await pool.query(
+        `update user_devices
+         set last_seen=now(), fingerprint=$3, ip=$4
+         where user_id=$1 and device_id=$2`,
+        [user.id, deviceId, fingerprint, ip]
+      );
+    }
+
+    // ip limit check (unique ips in last 24h)
+    if (ipLimit > 0) {
+      const ips = await pool.query(
+        `select count(distinct ip)::int as c
+         from user_devices
+         where user_id=$1
+           and last_seen > now() - interval '24 hours'`,
+        [user.id]
+      );
+
+      if (ips.rows[0].c > ipLimit) {
+        return res.status(403).json({ error: "IP limit reached" });
+      }
+    }
+
+    req.user = user;
+    next();
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "middleware failed" });
+  }
 }
 
 // 4) Chat (currently just confirms access; AI later)
@@ -245,26 +242,31 @@ app.post("/chat", requireActiveSubAndLimits, async (req, res) => {
 
 // 5) (Optional) upgrade to paid manually (for later)
 app.post("/admin/mark-paid", requireAdmin, async (req, res) => {
-  const { user_id, days } = req.body || {};
-  if (!user_id) return res.status(400).json({ error: "user_id required" });
+  try {
+    const { user_id, days } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: "user_id required" });
 
-  const dur = Number(days ?? 30);
+    const dur = Number(days ?? 30);
 
-  await pool.query(
-    `insert into subscriptions (user_id, plan, active, start_at, end_at, ip_limit, device_limit, is_trial)
-     values ($1, 'paid', true, now(), now() + ($2 || ' days')::interval, 2, 2, false)
-     on conflict (user_id) do update
-       set plan='paid',
-           active=true,
-           start_at=now(),
-           end_at=now() + ($2 || ' days')::interval,
-           ip_limit=2,
-           device_limit=2,
-           is_trial=false`,
-    [user_id, dur]
-  );
+    await pool.query(
+      `insert into subscriptions (user_id, plan, active, start_at, end_at, ip_limit, device_limit, is_trial)
+       values ($1, 'paid', true, now(), now() + ($2 * interval '1 day'), 2, 2, false)
+       on conflict (user_id) do update
+         set plan='paid',
+             active=true,
+             start_at=now(),
+             end_at=now() + ($2 * interval '1 day'),
+             ip_limit=2,
+             device_limit=2,
+             is_trial=false`,
+      [user_id, dur]
+    );
 
-  res.json({ success: true });
+    res.json({ success: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "mark-paid failed" });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
