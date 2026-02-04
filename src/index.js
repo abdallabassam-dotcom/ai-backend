@@ -92,10 +92,11 @@ app.post("/admin/generate-trial-code", requireAdmin, async (req, res) => {
     const code = "TRIAL-" + crypto.randomBytes(4).toString("hex").toUpperCase();
 
     await pool.query(
-      `insert into trial_codes (code, used, duration_days, expires_at)
-       values ($1, false, $2, now() + ($3 || ' days')::interval)`,
-      [code, days, expiresInDays]
-    );
+  `insert into trial_codes (code, used, duration_days, expires_at)
+   values ($1, false, $2, now() + ($3 * interval '1 day'))`,
+  [code, days, expiresInDays]
+);
+
 
     res.json({ code, days });
   } catch (e) {
